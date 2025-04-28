@@ -1,10 +1,10 @@
 import os
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import intel_extension_for_pytorch as ipex
 import torch
 from intel_extension_for_pytorch.llm.modules import PagedAttention
-from transformers import Cache, PretrainedConfig
+from transformers import Cache, PretrainedConfig, StaticCache
 
 from optimum.intel.utils.import_utils import is_ipex_version
 
@@ -269,3 +269,126 @@ class IPEXPagedCache(Cache):
         for i in free_table:
             if not (self.block_tables == i).any():
                 self.free_blocks[i] = 1
+
+
+class IPEXStaticCache(Cache):
+    def __init__(
+        self,
+        cache: StaticCache,
+    ):
+        super().__init__()
+        self.max_batch_size = cache.max_batch_size
+        self.max_cache_len = cache.max_cache_len
+        self.head_dim = cache.head_dim
+        self.dtype = cache.dtype
+        self.tp_idx = 0
+        self.num_key_value_heads = cache.num_key_value_heads
+        self.key_cache: List[torch.Tensor] = []
+        self.value_cache: List[torch.Tensor] = []
+        self.seq_cnt = int(cache.get_seq_length())
+
+        self.key_prompt: List[torch.Tensor] = []
+        self.value_prompt: List[torch.Tensor] = []
+
+        bs = cache.key_cache[0].size(0)
+        seqlen = cache.key_cache[0].size(2)
+
+        for i in range(len(cache.key_cache)):
+            self.key_cache.append(
+                cache.key_cache[i]
+                .permute(2, 0, 1, 3)
+                .reshape([seqlen, bs, self.num_key_value_heads, self.head_dim])
+                .contiguous()
+            )
+            self.value_cache.append = (
+                cache.value_cache[i]
+                .permute(2, 0, 1, 3)
+                .reshape([seqlen, bs, self.num_key_value_heads, self.head_dim])
+                .contiguous()
+            )
+            self._release_original_cache(cache, i)
+
+    def _release_original_cache(self, cache, layer_idx):
+        permute_order = (1, 2, 0, 3)
+        # key_cache and value_cache always appear in pairs
+        if getattr(cache, f"key_cache_{layer_idx}", None) is not None:
+            setattr(
+                cache,
+                f"key_cache_{layer_idx}",
+                self.key_cache[layer_idx].permute(*permute_order),
+            )
+            setattr(
+                cache,
+                f"value_cache_{layer_idx}",
+                self.value_cache[layer_idx].permute(*permute_order),
+            )
+        cache.key_cache[layer_idx] = self.key_cache[layer_idx].permute(*permute_order)
+        cache.value_cache[layer_idx] = self.value_cache[layer_idx].permute(*permute_order)
+
+    def update(
+        self,
+        key_states: List[torch.Tensor],
+        value_states: List[torch.Tensor],
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cache_position = cache_kwargs.get("cache_position")
+        beam_search = cache_kwargs.get("beam_search", False)
+        num_heads = cache_kwargs.get("num_heads", self.num_key_value_heads)
+        # update kv cache size
+        # store kv prompt cache if beam search
+        seqlen = self.update_or_get_seq_cnt(layer_idx, key_states) + key_states.size(2)
+        if beam_search and key_states.size(2) > 1:
+            self.key_prompt.append(key_states)
+            self.value_prompt.append(value_states)
+            return key_states, value_states
+        # if not prompt in beam search or greedy search, update the seqlen in kv cache
+        self.key_cache[layer_idx] = self.key_cache[layer_idx].to(device=key_states.device)
+        self.value_cache[layer_idx] = self.value_cache[layer_idx].to(device=value_states.device)
+        k_out = self.key_cache[layer_idx]
+        v_out = self.value_cache[layer_idx]
+
+        if cache_position is None:
+            k_out.copy_(key_states)
+            v_out.copy_(value_states)
+        else:
+            # Note: here we use `tensor.index_copy_(dim, index, tensor)` that is equivalent to
+            # `tensor[:, :, index] = tensor`, but the first one is compile-friendly and it does explicitly an in-place
+            # operation, that avoids copies and uses less memory.
+            try:
+                k_out.index_copy_(2, cache_position, key_states)
+                v_out.index_copy_(2, cache_position, value_states)
+            except NotImplementedError:
+                # The operator 'aten::index_copy.out' is not currently implemented for the MPS device.
+                k_out[:, :, cache_position] = key_states
+                v_out[:, :, cache_position] = value_states
+
+        return k_out[:, :, :seqlen, :], v_out[:, :, :seqlen, :]
+
+    def update_or_get_seq_cnt(
+        self,
+        layer_idx: int = -1,
+        key_states: torch.Tensor = None,
+    ):
+        if key_states is not None and layer_idx == len(self.key_cache) - 1:
+            seqlen = key_states.shape[-2]
+            self.seq_cnt += seqlen
+        return self.seq_cnt
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the sequence length of the cached states that were seen by the model."""
+        # Occupied cache == any slot in the 3rd dim (sequence length) holds a non-zero value. To save on compute, let's
+        # limit the check to the first batch member and head dimension.
+        # TODO: deprecate this function in favor of `cache_position`
+        return self.seq_cnt
+
+    def get_max_length(self) -> Optional[int]:
+        """Returns the maximum sequence length of the cached states."""
+        return self.max_cache_len
+
+    def reset(self):
+        """Resets the cache values while preserving the objects"""
+        for layer_idx in range(len(self.key_cache)):
+            # In-place ops prevent breaking the static address
+            self.key_cache[layer_idx].zero_()
+            self.value_cache[layer_idx].zero_()

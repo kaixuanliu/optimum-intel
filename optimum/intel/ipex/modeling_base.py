@@ -47,7 +47,7 @@ from optimum.exporters import TasksManager
 from optimum.modeling_base import OptimizedModel
 from optimum.utils import NormalizedConfigManager
 
-from ...exporters.ipex.cache_utils import IPEXPagedCache
+from ...exporters.ipex.cache_utils import IPEXPagedCache, IPEXStaticCache
 from ...exporters.ipex.model_patcher import (
     _IPEX_EXPORTED_GENERATION_TASKS,
     _IPEX_MINIMUM_VERSION_FOR_PATCHING,
@@ -355,7 +355,7 @@ class IPEXModelForCausalLM(IPEXModel, GenerationMixin):
         generation_method = generation_config.get_generation_mode().value
         if (
             getattr(self.model.config, "compile", False)
-            and generation_config.cache_implementation != "ipex_paged"
+            and generation_config.cache_implementation != "ipex_static"
             and self._supports_static_cache
         ):
             # Use static cache for torch compile
@@ -396,15 +396,20 @@ class IPEXModelForCausalLM(IPEXModel, GenerationMixin):
             )
         # Patch functions to support ipex_paged cache
         if self._add_patch:
-            transformers.generation.utils.NEED_SETUP_CACHE_CLASSES_MAPPING["ipex_paged"] = IPEXPagedCache
-            self.generation_config.cache_implementation = "ipex_paged"
+            # transformers.generation.utils.NEED_SETUP_CACHE_CLASSES_MAPPING["ipex_paged"] = IPEXPagedCache
+            transformers.generation.utils.NEED_SETUP_CACHE_CLASSES_MAPPING["ipex_static"] = IPEXStaticCache
+            # self.generation_config.cache_implementation = "ipex_paged"
+            self.generation_config._cache_implementation = "ipex_static"
             if is_transformers_version(">=", "4.45.0"):
-                if "ipex_paged" not in transformers.generation.configuration_utils.ALL_CACHE_IMPLEMENTATIONS:
-                    transformers.generation.configuration_utils.ALL_CACHE_IMPLEMENTATIONS.append("ipex_paged")
+                # if "ipex_paged" not in transformers.generation.configuration_utils.ALL_CACHE_IMPLEMENTATIONS:
+                #     transformers.generation.configuration_utils.ALL_CACHE_IMPLEMENTATIONS.append("ipex_paged")
+                if "ipex_static" not in transformers.generation.configuration_utils.ALL_CACHE_IMPLEMENTATIONS:
+                    transformers.generation.configuration_utils.ALL_CACHE_IMPLEMENTATIONS.append("ipex_static")
             if kwargs.get("generation_config", None):
                 # Change cache implementation temporarily
                 orig_cache_implementation = kwargs["generation_config"].cache_implementation
-                kwargs["generation_config"].cache_implementation = "ipex_paged"
+                # kwargs["generation_config"].cache_implementation = "ipex_paged"
+                kwargs["generation_config"]._cache_implementation = "ipex_static"
 
         if self._add_patch and kwargs.get("assistant_model", None):
             transformers.generation.utils._crop_past_key_values = _ipex_crop_past_key_values
