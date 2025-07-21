@@ -869,7 +869,7 @@ def _mistral_model_forward(
 
 
 class _IPEXAttention(nn.Module):
-    def __init__(self, module, device, config) -> None:
+    def __init__(self, module, device, config, layer_idx=None) -> None:
         super().__init__()
         _setattr_from_module(self, module)
         self.config = config
@@ -881,6 +881,12 @@ class _IPEXAttention(nn.Module):
             0, self.num_key_value_heads, dtype=torch.int32, device=self.module_device
         ).repeat_interleave(self.num_groups)
         self.use_sdpa = False
+        # Ensure layer_idx is properly set for torch compile
+        if layer_idx is not None:
+            self.layer_idx = layer_idx
+        elif not hasattr(self, "layer_idx"):
+            # Fallback: try to get from the module or set to 0
+            self.layer_idx = getattr(module, "layer_idx", 0)
 
     def qkv_gemm(self, hidden_states):
         raise NotImplementedError("Need to implement in specific model class")
@@ -1037,8 +1043,8 @@ class _IPEXAttention(nn.Module):
 
 
 class _IPEXLlamaAttention(_IPEXAttention):
-    def __init__(self, module, device, config) -> None:
-        super().__init__(module, device, config)
+    def __init__(self, module, device, config, layer_idx=None) -> None:
+        super().__init__(module, device, config, layer_idx)
         if getattr(config, "quantization_config", None) is None:
             concat_weight = torch.concat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight]).contiguous()
             bias_list = [bias for bias in [self.q_proj.bias, self.k_proj.bias, self.v_proj.bias] if bias is not None]
@@ -1072,9 +1078,9 @@ class _IPEXLlamaAttention(_IPEXAttention):
 
 
 class _IPEXFalconAttention(_IPEXAttention):
-    def __init__(self, module, device, config):
+    def __init__(self, module, device, config, layer_idx=None):
         self.num_key_value_heads = config.num_key_value_heads
-        super().__init__(module, device, config)
+        super().__init__(module, device, config, layer_idx)
         self.q_slice = self.head_dim * config.num_kv_heads
         self.k_slice = self.q_slice + self.head_dim
         self.v_slice = self.k_slice + self.head_dim
@@ -1096,8 +1102,8 @@ class _IPEXFalconAttention(_IPEXAttention):
 
 
 class _IPEXGPT2Attention(_IPEXAttention):
-    def __init__(self, module, device, config) -> None:
-        super().__init__(module, device, config)
+    def __init__(self, module, device, config, layer_idx=None) -> None:
+        super().__init__(module, device, config, layer_idx)
         _setattr_from_module(self, module)
         if not config.compile and getattr(config, "quantization_config", None) is None:
             self.c_attn_linear = nn.Linear(self.c_attn.weight.shape[0], self.c_attn.weight.shape[1])
@@ -1228,10 +1234,13 @@ class _IPEXGPT2MLP(nn.Module):
 
 # Adapted from https://github.com/huggingface/transformers/blob/v4.38.2/src/transformers/models/llama/modeling_llama.py#L694
 class _IPEXLlamaDecoderLayer(nn.Module):
-    def __init__(self, module, device, config):
+    def __init__(self, module, device, config, layer_idx=None):
         super().__init__()
         _setattr_from_module(self, module)
-        self.self_attn = _IPEXLlamaAttention(module.self_attn, device, config)
+        # Extract layer_idx from module if not provided
+        if layer_idx is None:
+            layer_idx = getattr(module, "layer_idx", getattr(module.self_attn, "layer_idx", 0))
+        self.self_attn = _IPEXLlamaAttention(module.self_attn, device, config, layer_idx)
         self.mlp = _IPEXLlamaMLP(module.mlp, device, config)
         if getattr(config, "quantization_config", None):
             _remove_hooks_for_ipex(self, True)
@@ -1263,10 +1272,13 @@ class _IPEXLlamaDecoderLayer(nn.Module):
 
 
 class _IPEXFalconDecoderLayer(nn.Module):
-    def __init__(self, module, device, config):
+    def __init__(self, module, device, config, layer_idx=None):
         super().__init__()
         _setattr_from_module(self, module)
-        self.self_attention = _IPEXFalconAttention(module.self_attention, device, config)
+        # Extract layer_idx from module if not provided
+        if layer_idx is None:
+            layer_idx = getattr(module, "layer_idx", getattr(module.self_attention, "layer_idx", 0))
+        self.self_attention = _IPEXFalconAttention(module.self_attention, device, config, layer_idx)
         self.mlp = _IPEXFalconMLP(module.mlp, device, config)
         if getattr(config, "quantization_config", None):
             _remove_hooks_for_ipex(self, True)

@@ -63,7 +63,8 @@ logger = logging.getLogger(__name__)
 
 _IPEX_SUPPORT_MODEL_TYPES = ("llama", "bert", "vit", "falcon", "gpt2", "qwen2", "mistral")
 _IPEX_EXPORTED_GENERATION_METHODS = ("sample", "greedy_search", "beam_sample", "beam_search", "assisted_generation")
-_IPEX_MINIMUM_VERSION_FOR_COMPILE = "2.5.0"
+_IPEX_MINIMUM_VERSION_FOR_CPU_COMPILE = "2.5.0"
+_IPEX_MINIMUM_VERSION_FOR_XPU_COMPILE = "2.8.0"
 # Page attention model cannot use torch.compile for now.
 if is_torch_version("<", "2.6"):
     _COMPILE_NOT_READY_MODEL_TYPES = ("electra", "roformer", "gpt_neox", "beit", "llama", "falcon", "gpt2", "qwen2")
@@ -227,9 +228,9 @@ class IPEXModel(OptimizedModel):
 
     def can_compile(self):
         if (
-            self.model.device.type != "cpu"
-            or self.model.config.model_type in _COMPILE_NOT_READY_MODEL_TYPES
-            or is_ipex_version("<", _IPEX_MINIMUM_VERSION_FOR_COMPILE)
+            self.model.config.model_type in _COMPILE_NOT_READY_MODEL_TYPES
+            or (self.model.device.type == "cpu" and is_ipex_version("<", _IPEX_MINIMUM_VERSION_FOR_CPU_COMPILE))
+            or (self.model.device.type == "xpu" and is_ipex_version("<", _IPEX_MINIMUM_VERSION_FOR_XPU_COMPILE))
             or getattr(self.model.config, "quantization_config", None)
         ):
             return False
@@ -243,7 +244,10 @@ class IPEXModel(OptimizedModel):
         from torch._inductor import config as inductor_config
 
         # System level optimization
-        inductor_config.cpp_wrapper = True
+        if self.model.device.type == "xpu":
+            inductor_config.cpp_wrapper = False
+        else:
+            inductor_config.cpp_wrapper = True
         if self._add_patch and self.export_feature == "text-generation":
             # To avoid int value recompile.
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
