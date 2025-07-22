@@ -160,7 +160,6 @@ class IPEXPagedCache(Cache):
                     self.free_blocks[self.block_tables[i][b_idx]] = 0
             self.slots[i] = self.block_tables[i][start_block_idx[i]] * self.block_size + slot_offset_in_block[i]
 
-    @torch.compiler.disable
     def update(
         self,
         key_states: torch.Tensor,
