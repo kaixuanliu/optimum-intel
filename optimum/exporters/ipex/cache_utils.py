@@ -162,6 +162,7 @@ class IPEXPagedCache(Cache):
                     self.free_blocks[self.block_tables[i][b_idx]] = 0
             self.slots[i] = self.block_tables[i][start_block_idx[i]] * self.block_size + slot_offset_in_block[i]
 
+    @torch.compiler.disable
     def update(
         self,
         key_states: torch.Tensor,
@@ -181,12 +182,15 @@ class IPEXPagedCache(Cache):
         Return:
             A tuple containing the updated key and value states.
         """
+        # Avoid dynamo guards by using variables instead of direct indexing
+        key_cache_layer = self.key_cache[layer_idx]
+        value_cache_layer = self.value_cache[layer_idx]
 
         self.reshape_and_cache(
-            key_states, value_states, self.key_cache[layer_idx], self.value_cache[layer_idx], self.slots
+            key_states, value_states, key_cache_layer, value_cache_layer, self.slots
         )
 
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        return key_cache_layer, value_cache_layer
 
     def get_seq_length(self) -> int:
         """Returns the sequence length of the cached states that were seen by the model."""
